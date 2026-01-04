@@ -46,7 +46,7 @@ on:
 jobs:
   build:
     name: Build OFR by ${{ github.actor }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04  # 替换ubuntu-latest为22.04，兼容性更好
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     permissions:
@@ -55,68 +55,113 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
               
-    - name: Clean-up
+    - name: Clean-up Runner Environment
       uses: rokibhasansagar/slimhub_actions@main
+      with:
+        slim_all: true
+        delete_dotgit: false  # 保留.git目录，避免源码同步出错
 
-    - name: Swap Space
+    - name: Add 24GB Swap Space (Prevent OOM)
       uses: pierotofy/set-swap-space@master
       with:
         swap-size-gb: 24
       
-    - name: Build Environment
+    - name: Install Build Dependencies
       run: |
-        sudo apt install aria2 -y
+        # 更新系统并安装基础依赖
+        sudo apt update && sudo apt upgrade -y
+        sudo apt install -y aria2 bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev
+        # 按分支安装对应Java版本（关键：11.0用Java 11，12.1用Java 17）
+        if [ "${{ inputs.MANIFEST_BRANCH }}" = "11.0" ]; then
+          sudo apt install -y openjdk-11-jdk
+        else
+          sudo apt install -y openjdk-17-jdk
+        fi
+        # 安装OrangeFox官方脚本
         git clone https://gitlab.com/OrangeFox/misc/scripts.git -b master
         cd scripts
         sudo bash setup/android_build_env.sh
+        # 配置ccache加速编译
+        export USE_CCACHE=1
+        export CCACHE_EXEC=/usr/bin/ccache
+        ccache -M 50G
       
-    - name: Set-up Manifest
+    - name: Sync OrangeFox Source Code
       if: inputs.MANIFEST_BRANCH == '11.0' || inputs.MANIFEST_BRANCH == '12.1'
       run: |
         mkdir -p ${GITHUB_WORKSPACE}/OrangeFox
         cd ${GITHUB_WORKSPACE}/OrangeFox
+        # 配置Git身份（避免同步报错）
         git config --global user.name "${{ github.actor }}"
         git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+        # 克隆OrangeFox同步脚本
         git clone https://gitlab.com/OrangeFox/sync.git -b master
         cd sync
-        ./orangefox_sync.sh --branch ${{ inputs.MANIFEST_BRANCH }} --path ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}
+        # 同步对应分支源码（--depth=1加速）
+        ./orangefox_sync.sh --branch ${{ inputs.MANIFEST_BRANCH }} --path ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }} --depth=1
 
-    - name: Clone Snapuserd Dependencies
+    - name: Clone Snapuserd Dependencies (Fix Directory Exist Error)
       run: |
         cd ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}
-        git clone --depth=1 https://android.googlesource.com/platform/external/gflags -b android-12.1.0_r4 ./external/gflags
+        # 核心修复：先删除已存在的gflags目录，再克隆
+        rm -rf ./external/gflags
+        # 按分支适配gflags分支（11.0用android-11.0.0_r48，12.1用android-12.1.0_r4）
+        if [ "${{ inputs.MANIFEST_BRANCH }}" = "11.0" ]; then
+          GFLAGS_BRANCH="android-11.0.0_r48"
+        else
+          GFLAGS_BRANCH="android-12.1.0_r4"
+        fi
+        # 克隆gflags（--depth=1减少体积）
+        git clone --depth=1 https://android.googlesource.com/platform/external/gflags -b $GFLAGS_BRANCH ./external/gflags
         
     - name: Clone Device Tree
       run: |
         cd ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}
-        git clone ${{ inputs.DEVICE_TREE }} -b ${{ inputs.DEVICE_TREE_BRANCH }} ./${{ inputs.DEVICE_PATH }}
-        cd ${{ inputs.DEVICE_PATH }}
+        # 先创建设备路径目录，避免克隆失败
+        mkdir -p ./${{ inputs.DEVICE_PATH }}
+        # 克隆设备树（--depth=1加速）
+        git clone --depth=1 ${{ inputs.DEVICE_TREE }} -b ${{ inputs.DEVICE_TREE_BRANCH }} ./${{ inputs.DEVICE_PATH }}
+        # 记录设备树最新Commit ID
+        cd ./${{ inputs.DEVICE_PATH }}
         echo "COMMIT_ID=$(git rev-parse HEAD)" >> $GITHUB_ENV
 
-    - name: Building OrangeFox
+    - name: Build OrangeFox Recovery
       run: |
         cd ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}
+        # 容错处理：允许缺失依赖（适配老旧设备）
         set +e
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
+        export LC_ALL=C  # 避免字符编码错误
         set -e
-        lunch twrp_${{ inputs.DEVICE_NAME }}-eng && make clean && mka adbd ${{ inputs.BUILD_TARGET }}image
+        # 编译命令：适配OrangeFox的lunch格式（twrp_前缀）
+        lunch twrp_${{ inputs.DEVICE_NAME }}-eng
+        make clean  # 清理旧编译产物
+        mka -j$(nproc --all) adbd ${{ inputs.BUILD_TARGET }}image
 
-    - name: Set Release Properties
+    - name: Set Release Metadata
       run: |
-        echo "BUILD_DATE=$(TZ=Asia/Manila date +%Y%m%d)" >> $GITHUB_ENV
-        cd ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}
+        # 生成构建日期（UTC+8，适配国内时区）
+        echo "BUILD_DATE=$(TZ=Asia/Shanghai date +%Y%m%d_%H%M)" >> $GITHUB_ENV
+        # 验证编译产物是否存在
+        cd ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/out/target/product/${{ inputs.DEVICE_NAME }}
+        ls -la OrangeFox*.img OrangeFox*.zip || echo "Warning: No OrangeFox build found!"
 
-    - name: Upload to Release
+    - name: Upload Build to GitHub Release
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/out/target/product/${{ inputs.DEVICE_NAME }}/OrangeFox*.img
-          OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/out/target/product/${{ inputs.DEVICE_NAME }}/OrangeFox*.zip
-        name: OrangeFox Recovery for ${{ inputs.DEVICE_NAME }} // ${{ env.BUILD_DATE }}
-        tag_name: ${{ github.run_id }}
+          ${{ github.workspace }}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/out/target/product/${{ inputs.DEVICE_NAME }}/OrangeFox*.img
+          ${{ github.workspace }}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/out/target/product/${{ inputs.DEVICE_NAME }}/OrangeFox*.zip
+        name: OrangeFox Recovery for ${{ inputs.DEVICE_NAME }} | fox_${{ inputs.MANIFEST_BRANCH }} | ${{ env.BUILD_DATE }}
+        tag_name: OFR-${{ inputs.DEVICE_NAME }}-${{ env.BUILD_DATE }}
         body: |
-          ## OrangeFox Recovery Build - Unofficial
-          Build: fox_${{ inputs.MANIFEST_BRANCH }}
-          Device: [Device Tree/Branch](${{ inputs.DEVICE_TREE }}/tree/${{ inputs.DEVICE_TREE_BRANCH }})
-          Commit: Most recent [commit](${{ inputs.DEVICE_TREE }}/commit/${{ env.COMMIT_ID }}) during building.
+          ## OrangeFox Recovery Unofficial Build
+          - **Manifest Branch**: fox_${{ inputs.MANIFEST_BRANCH }}
+          - **Device**: ${{ inputs.DEVICE_NAME }}
+          - **Device Tree**: [${{ inputs.DEVICE_TREE_BRANCH }}](${{ inputs.DEVICE_TREE }}/tree/${{ inputs.DEVICE_TREE_BRANCH }})
+          - **Latest Commit**: [${{ env.COMMIT_ID }}](${{ inputs.DEVICE_TREE }}/commit/${{ env.COMMIT_ID }})
+          - **Build Target**: ${{ inputs.BUILD_TARGET }}
+          - **Build Time**: ${{ env.BUILD_DATE }} (UTC+8)
+        draft: false
+        prerelease: true
